@@ -15,6 +15,7 @@ async def echo(request: Request):
 @router.post("/download")
 async def download(request: Request):
     data = await request.json()
+    destinationDirectory = data["downloadDirectory"]
     print("Received data:", data)
 
     def build_yt_dlp_command(data: dict) -> list:
