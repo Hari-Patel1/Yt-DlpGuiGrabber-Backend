@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Request
+from fastapi.responses import StreamingResponse
+import asyncio
 import subprocess
 
 router = APIRouter()
@@ -13,10 +15,8 @@ async def echo(request: Request):
     return {"you_sent": data}
 
 @router.post("/download")
-async def download(request: Request):
+async def download_stream(request: Request):
     data = await request.json()
-    destinationDirectory = data["downloadDirectory"]
-    print("Received data:", data)
 
     def build_yt_dlp_command(data: dict) -> list:
         command = ["C:\\Tools\\yt-dlp.exe"]
@@ -27,7 +27,6 @@ async def download(request: Request):
         audio_quality = data.get("audioQuality", "128k").strip()
         video_quality = data.get("videoQuality", "1080p").strip()
         embed_thumbnail = data.get("embedThumbnail", False)
-        download_album_art = data.get("downloadAlbumArt", False)  # we'll ignore this for separate download
         add_metadata = data.get("addMetadata", False)
 
         output_template = "%(title)s - %(uploader)s.%(ext)s"
@@ -47,31 +46,32 @@ async def download(request: Request):
         if add_metadata:
             command.append("--add-metadata")
 
-        # REMOVE --write-thumbnail so album art is NOT saved separately
-        # if download_album_art:
-        #     command.append("--write-thumbnail")  # <-- remove this line
+        # Do not add --write-thumbnail to avoid separate album art file
 
         command.extend(["-o", output_template])
         command.append(url)
 
         return command
 
-
     cmd = build_yt_dlp_command(data)
     print("Running command:", " ".join(cmd))
 
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return {
-            "status": "success",
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "command": " ".join(cmd),
-        }
-    except subprocess.CalledProcessError as e:
-        return {
-            "status": "error",
-            "stdout": e.stdout,
-            "stderr": e.stderr,
-            "command": " ".join(cmd),
-        }
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        text=True,
+    )
+
+    async def event_generator():
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            # Send each line as an SSE message
+            yield f"data: {line.strip()}\n\n"
+
+        await process.wait()
+        yield "data: [Download complete]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
