@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from pathlib import Path
 import subprocess
 import json
@@ -15,27 +15,18 @@ logger = logging.getLogger(__name__)
 async def download(request: Request):
     try:
         data = await request.json()
-    except Exception as e:
+    except Exception:
         return JSONResponse(status_code=400, content={"error": "Invalid JSON payload"})
 
-    # Validate required fields
     url = data.get("url", "").strip()
     if not url:
         return JSONResponse(status_code=400, content={"error": "Missing 'url' in request"})
 
-    # Use provided directory or fallback to user's Downloads
-    destinationDirectory = data.get("downloadDirectory")
-    if not destinationDirectory:
-        destinationDirectory = str(Path.home() / "Downloads")
-    else:
-        destinationDirectory = os.path.abspath(destinationDirectory)
-
     client_ip = request.client.host or "unknown"
-    logger.info(f"Client IP: {client_ip}")
-
-    # Create unique temp folder per request
     request_id = uuid.uuid4().hex
-    temp_dir = Path("temp_downloads") / f"{client_ip}_{request_id}"
+    client_id = f"{client_ip}_{request_id}"
+
+    temp_dir = Path("temp_downloads") / client_id
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     def build_yt_dlp_command(data: dict) -> list:
@@ -72,7 +63,6 @@ async def download(request: Request):
 
     def stream_process():
         yield f"data: {json.dumps({'type': 'status', 'message': 'Preparing download folder'})}\n\n"
-
         logger.info(f"Running command: {' '.join(cmd)}")
         yield f"data: {json.dumps({'type': 'command', 'message': ' '.join(cmd)})}\n\n"
 
@@ -108,24 +98,38 @@ async def download(request: Request):
             yield f"data: {json.dumps({'type': 'error', 'message': f'yt-dlp failed with code {process.returncode}'})}\n\n"
             return
 
-        yield f"data: {json.dumps({'type': 'status', 'message': 'Moving files to final directory'})}\n\n"
+        yield f"data: {json.dumps({'type': 'status', 'message': 'Download complete'})}\n\n"
 
-        try:
-            destination_path = Path(destinationDirectory)
-            destination_path.mkdir(parents=True, exist_ok=True)
-
-            for file in temp_dir.iterdir():
-                target_file = destination_path / file.name
-                shutil.move(str(file), str(target_file))
-                yield f"data: {json.dumps({'type': 'moved', 'message': f'Moved {file.name}'})}\n\n"
-
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Failed to move files: {str(e)}'})}\n\n"
-            return
-
-        yield f"data: {json.dumps({'type': 'done', 'message': 'Download and move complete'})}\n\n"
-
-        # Cleanup temp folder
-        # shutil.rmtree(temp_dir, ignore_errors=True)
+        # Send download links
+        file_list = [f.name for f in temp_dir.iterdir()]
+        yield f"data: {json.dumps({'type': 'download-ready', 'client_id': client_id, 'files': file_list})}\n\n"
 
     return StreamingResponse(stream_process(), media_type="text/event-stream")
+
+@router.get("/download/file/{client_id}/{filename}")
+async def get_file(client_id: str, filename: str):
+    file_path = Path("temp_downloads") / client_id / filename
+
+    if not file_path.exists():
+        return JSONResponse(status_code=404, content={"error": "File not found"})
+
+    # Use FileResponse and delete the file AFTER it has been sent
+    response = FileResponse(file_path, filename=filename)
+
+    # After sending, schedule file deletion using background tasks
+    from fastapi import BackgroundTasks
+
+    async def delete_file():
+        try:
+            file_path.unlink()
+            # If directory is empty, delete it too
+            if not any(file_path.parent.iterdir()):
+                file_path.parent.rmdir()
+        except Exception as e:
+            logger.warning(f"Failed to delete file {file_path}: {e}")
+
+    # Wrap response in a background task
+    background_tasks = BackgroundTasks()
+    background_tasks.add_task(delete_file)
+
+    return response.copy(background=background_tasks)
