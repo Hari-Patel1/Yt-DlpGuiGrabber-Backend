@@ -1,26 +1,18 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
-import asyncio
 import subprocess
+import json
 
 router = APIRouter()
 
-@router.get("/ping")
-def ping():
-    return {"message": "pong"}
-
-@router.post("/echo")
-async def echo(request: Request):
-    data = await request.json()
-    return {"you_sent": data}
-
 @router.post("/download")
-async def download_stream(request: Request):
+async def download(request: Request):
     data = await request.json()
+    destinationDirectory = data["downloadDirectory"]
+    print("Received data:", data)
 
     def build_yt_dlp_command(data: dict) -> list:
         command = ["C:\\Tools\\yt-dlp.exe"]
-
         url = data.get("url", "").strip()
         ext = data.get("extension", "mp4").strip().lower()
         audio_only = data.get("audioOnly", False)
@@ -28,7 +20,6 @@ async def download_stream(request: Request):
         video_quality = data.get("videoQuality", "1080p").strip()
         embed_thumbnail = data.get("embedThumbnail", False)
         add_metadata = data.get("addMetadata", False)
-
         output_template = "%(title)s - %(uploader)s.%(ext)s"
 
         if audio_only or ext == "mp3":
@@ -42,36 +33,49 @@ async def download_stream(request: Request):
 
         if embed_thumbnail:
             command.append("--embed-thumbnail")
-
         if add_metadata:
             command.append("--add-metadata")
 
-        # Do not add --write-thumbnail to avoid separate album art file
-
         command.extend(["-o", output_template])
         command.append(url)
-
         return command
 
     cmd = build_yt_dlp_command(data)
     print("Running command:", " ".join(cmd))
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        text=True,
-    )
+    def stream_process():
+        yield f"data: {json.dumps({'type': 'status', 'message': 'Download started'})}\n\n"
+        yield f"data: {json.dumps({'type': 'command', 'message': ' '.join(cmd)})}\n\n"
 
-    async def event_generator():
-        while True:
-            line = await process.stdout.readline()
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        for line in iter(process.stdout.readline, ''):
+            line = line.strip()
             if not line:
-                break
-            # Send each line as an SSE message
-            yield f"data: {line.strip()}\n\n"
+                continue
 
-        await process.wait()
-        yield "data: [Download complete]\n\n"
+            # Basic parsing for status vs progress vs error
+            if "Downloading" in line:
+                event_type = "download"
+            elif "ERROR" in line or "Error" in line:
+                event_type = "error"
+            elif "Merger" in line or "Merging" in line:
+                event_type = "merge"
+            elif "Destination" in line:
+                event_type = "save"
+            else:
+                event_type = "info"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+            yield f"data: {json.dumps({'type': event_type, 'message': line})}\n\n"
+
+        process.stdout.close()
+        process.wait()
+
+        yield f"data: {json.dumps({'type': 'done', 'message': 'Download finished'})}\n\n"
+
+    return StreamingResponse(stream_process(), media_type="text/event-stream")
