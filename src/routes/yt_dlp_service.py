@@ -106,18 +106,14 @@ async def download(request: Request):
 
     return StreamingResponse(stream_process(), media_type="text/event-stream")
 
+from fastapi import BackgroundTasks
+
 @router.get("/download/file/{client_id}/{filename}")
-async def get_file(client_id: str, filename: str):
+async def get_file(client_id: str, filename: str, background_tasks: BackgroundTasks):
     file_path = Path("temp_downloads") / client_id / filename
 
     if not file_path.exists():
         return JSONResponse(status_code=404, content={"error": "File not found"})
-
-    # Use FileResponse and delete the file AFTER it has been sent
-    response = FileResponse(file_path, filename=filename)
-
-    # After sending, schedule file deletion using background tasks
-    from fastapi import BackgroundTasks
 
     async def delete_file():
         try:
@@ -128,8 +124,12 @@ async def get_file(client_id: str, filename: str):
         except Exception as e:
             logger.warning(f"Failed to delete file {file_path}: {e}")
 
-    # Wrap response in a background task
-    background_tasks = BackgroundTasks()
+    # Attach the delete_file task to the background tasks
     background_tasks.add_task(delete_file)
 
-    return response.copy(background=background_tasks)
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        background=background_tasks  # <-- pass background tasks here
+    )
+
